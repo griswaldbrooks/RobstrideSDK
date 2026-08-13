@@ -1,5 +1,5 @@
-// Copyright 2026
-// Apache License, Version 2.0
+// Copyright 2026 Minjo Kim
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef ROBSTRIDE_SDK__ROBSTRIDE_MOTOR_HPP_
 #define ROBSTRIDE_SDK__ROBSTRIDE_MOTOR_HPP_
@@ -15,8 +15,7 @@
 namespace robstride_sdk
 {
 
-/// @brief Monotonic clock timestamp (ns) used to detect stale/disconnected
-/// motors, independent of ROS/sim time.
+// Monotonic timestamp (ns) used to detect stale motors.
 inline uint64_t NowNs()
 {
   return static_cast<uint64_t>(
@@ -24,10 +23,8 @@ inline uint64_t NowNs()
       std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-/// @brief Lock-free snapshot of a single motor's most recently decoded state.
-/// Written only by the CAN bus's background read thread; read by the
-/// control loop. Individual fields are plain atomics (not a seqlock) since
-/// momentary tearing between fields is acceptable for telemetry.
+// Lock-free snapshot of a motor's decoded state.
+// Written by the CAN read thread, read by the control loop.
 struct MotorState
 {
   std::atomic<float> position{0.0f};
@@ -53,6 +50,14 @@ public:
   const ActuatorLimits & limits() const {return limits_;}
   MotorState & state() {return state_;}
   const MotorState & state() const {return state_;}
+
+  // Call after a set-zero command: the new mechanical zero would otherwise
+  // look like a wraparound to UnwrapPosition().
+  void ResetPositionTracking()
+  {
+    position_initialized_.store(false, std::memory_order_relaxed);
+    position_offset_.store(0.0f, std::memory_order_relaxed);
+  }
 
   can_frame EncodeMotionCommand(float position, float velocity, float kp, float kd, float torque)
   const
@@ -86,39 +91,55 @@ public:
 
   can_frame EncodeSetZero() const {return EncodeSimple(COMM_SET_MECH_ZERO, 1);}
 
-  can_frame EncodeParamReadFloat(uint16_t index) const {return EncodeParamFrame(index, nullptr);}
+  can_frame EncodeParamReadFloat(uint16_t index) const
+  {
+    return EncodeParamHeader(COMM_PARAM_READ, index);
+  }
 
   can_frame EncodeParamWriteFloat(uint16_t index, float value) const
   {
-    return EncodeParamFrame(index, &value);
+    can_frame frame = EncodeParamHeader(COMM_PARAM_WRITE, index);
+    std::memcpy(&frame.data[4], &value, sizeof(value));
+    return frame;
   }
 
   can_frame EncodeParamWriteU8(uint16_t index, uint8_t value) const
   {
-    can_frame frame = EncodeParamFrame(index, nullptr);
+    can_frame frame = EncodeParamHeader(COMM_PARAM_WRITE, index);
     frame.data[4] = value;
     return frame;
   }
 
   can_frame EncodeParamWriteU32(uint16_t index, uint32_t value) const
   {
-    can_frame frame = EncodeParamFrame(index, nullptr);
+    can_frame frame = EncodeParamHeader(COMM_PARAM_WRITE, index);
     std::memcpy(&frame.data[4], &value, sizeof(value));
     return frame;
   }
 
-  /// @brief Decode a received frame addressed to this motor and update its
-  /// lock-free state snapshot. Called only from the CAN bus's read thread.
+  // Decode a received frame and update the state snapshot.
+  // Called only from the CAN read thread.
   void HandleFrame(uint8_t comm_type, uint16_t data_area_2, const uint8_t * data, uint8_t dlc)
   {
-    state_.last_update_ns.store(NowNs(), std::memory_order_relaxed);
+    const uint64_t now_ns = NowNs();
+    const uint64_t prev_update_ns = state_.last_update_ns.load(std::memory_order_relaxed);
+    state_.last_update_ns.store(now_ns, std::memory_order_relaxed);
+
+    // A long gap (power cycle, bus down) invalidates the unwrap offset:
+    // start a fresh baseline instead of carrying it across.
+    constexpr uint64_t kStaleGapNs = 1'000'000'000ull;
+    if (prev_update_ns != 0 && now_ns - prev_update_ns > kStaleGapNs) {
+      ResetPositionTracking();
+    }
+
     if (comm_type == COMM_MOTOR_FEEDBACK && dlc >= 8) {
       const uint16_t pos_u = (static_cast<uint16_t>(data[0]) << 8) | data[1];
       const uint16_t vel_u = (static_cast<uint16_t>(data[2]) << 8) | data[3];
       const uint16_t torque_u = (static_cast<uint16_t>(data[4]) << 8) | data[5];
       const uint16_t temp_u = (static_cast<uint16_t>(data[6]) << 8) | data[7];
       state_.position.store(
-        Uint16ToFloat(pos_u, -limits_.position_max, limits_.position_max),
+        UnwrapPosition(
+          Uint16ToFloat(pos_u, -limits_.position_max, limits_.position_max)),
         std::memory_order_relaxed);
       state_.velocity.store(
         Uint16ToFloat(vel_u, -limits_.velocity_max, limits_.velocity_max),
@@ -153,10 +174,11 @@ private:
     return frame;
   }
 
-  can_frame EncodeParamFrame(uint16_t index, const float * value) const
+  // Common header for param read/write frames. comm_type is always
+  // explicit so a write can never be tagged as a read.
+  can_frame EncodeParamHeader(uint8_t comm_type, uint16_t index) const
   {
     can_frame frame{};
-    const uint8_t comm_type = value ? COMM_PARAM_WRITE : COMM_PARAM_READ;
     frame.can_id =
       BuildExtendedId(comm_type, static_cast<uint16_t>(master_id_) << 8, motor_id_) |
       CAN_EFF_FLAG;
@@ -164,10 +186,32 @@ private:
     std::memset(frame.data, 0, 8);
     frame.data[0] = static_cast<uint8_t>(index & 0xFF);
     frame.data[1] = static_cast<uint8_t>(index >> 8);
-    if (value) {
-      std::memcpy(&frame.data[4], value, sizeof(float));
-    }
     return frame;
+  }
+
+  // Position feedback wraps at +/-position_max (+/-4pi). Rebuild a
+  // continuous value by folding each wrap into an accumulated offset.
+  float UnwrapPosition(float raw_position)
+  {
+    if (!position_initialized_.exchange(true, std::memory_order_relaxed)) {
+      last_raw_position_.store(raw_position, std::memory_order_relaxed);
+      return raw_position;
+    }
+    const float last_raw = last_raw_position_.load(std::memory_order_relaxed);
+    const float delta = raw_position - last_raw;
+    const float wrap_span = static_cast<float>(2.0 * limits_.position_max);
+    // Only the CAN read thread does this read-modify-write, so a plain
+    // load-then-store is safe.
+    float offset = position_offset_.load(std::memory_order_relaxed);
+    if (delta > static_cast<float>(limits_.position_max)) {
+      offset -= wrap_span;
+      position_offset_.store(offset, std::memory_order_relaxed);
+    } else if (delta < -static_cast<float>(limits_.position_max)) {
+      offset += wrap_span;
+      position_offset_.store(offset, std::memory_order_relaxed);
+    }
+    last_raw_position_.store(raw_position, std::memory_order_relaxed);
+    return raw_position + offset;
   }
 
   uint8_t motor_id_;
@@ -175,6 +219,9 @@ private:
   ActuatorType type_;
   ActuatorLimits limits_;
   MotorState state_;
+  std::atomic<bool> position_initialized_{false};
+  std::atomic<float> last_raw_position_{0.0f};
+  std::atomic<float> position_offset_{0.0f};
 };
 
 }  // namespace robstride_sdk
