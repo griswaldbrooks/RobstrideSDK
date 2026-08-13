@@ -1,5 +1,5 @@
-// Copyright 2026
-// Apache License, Version 2.0
+// Copyright 2026 Minjo Kim
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef ROBSTRIDE_SDK__ROBSTRIDE_PROTOCOL_HPP_
 #define ROBSTRIDE_SDK__ROBSTRIDE_PROTOCOL_HPP_
@@ -13,8 +13,7 @@
 namespace robstride_sdk
 {
 
-// Communication types (bits 24~28 of the 29-bit extended CAN ID), per the
-// RobStride CAN protocol (private protocol).
+// Communication types, bits 24~28 of the 29-bit extended CAN ID.
 enum CommType : uint8_t
 {
   COMM_GET_DEVICE_ID = 0x00,
@@ -55,9 +54,7 @@ enum class ActuatorType : uint8_t
   RS06 = 6,
 };
 
-// Ranges used to quantize/dequantize the Type-1 (motion control) and Type-2
-// (feedback) CAN frame fields, taken from the official RobStride CAN
-// protocol manuals (Section 4.1.2/4.1.3) for each motor model.
+// Per-model quantization ranges for Type-1 and Type-2 frame fields.
 struct ActuatorLimits
 {
   double position_max;  // rad, symmetric range is [-position_max, +position_max]
@@ -89,8 +86,7 @@ inline const ActuatorLimits & GetActuatorLimits(ActuatorType type)
 
 inline ActuatorType ActuatorTypeFromString(const std::string & name)
 {
-  // Accepts "00".."06", "0".."6" (xacro numeric literals drop leading
-  // zeros), or "RS00".."RS06".
+  // Accepts "00".."06", "0".."6" or "RS00".."RS06".
   if (name == "00" || name == "0" || name == "RS00") {return ActuatorType::RS00;}
   if (name == "01" || name == "1" || name == "RS01") {return ActuatorType::RS01;}
   if (name == "02" || name == "2" || name == "RS02") {return ActuatorType::RS02;}
@@ -101,8 +97,23 @@ inline ActuatorType ActuatorTypeFromString(const std::string & name)
   throw std::invalid_argument("Unknown RobStride actuator_type: " + name);
 }
 
-// Parameter index list (Section 4.1.13 "Read and write a single parameter
-// list"), values common across motor models.
+inline RunMode RunModeFromString(const std::string & name)
+{
+  // "motion" uses Type-1 frames; the other modes set run_mode (0x7005)
+  // and are driven by loc_ref/spd_ref/iq_ref writes.
+  if (name.empty() || name == "motion" || name == "mit" || name == "0") {
+    return RunMode::RUN_MODE_MOTION;
+  }
+  if (name == "position_pp" || name == "pp" || name == "1") {return RunMode::RUN_MODE_POSITION_PP;}
+  if (name == "velocity" || name == "2") {return RunMode::RUN_MODE_VELOCITY;}
+  if (name == "current" || name == "3") {return RunMode::RUN_MODE_CURRENT;}
+  if (name == "position_csp" || name == "csp" || name == "5") {
+    return RunMode::RUN_MODE_POSITION_CSP;
+  }
+  throw std::invalid_argument("Unknown RobStride control_mode: " + name);
+}
+
+// Parameter index list, common across motor models.
 namespace ParamIndex
 {
 constexpr uint16_t RUN_MODE = 0x7005;
@@ -133,8 +144,7 @@ constexpr uint16_t DAMPER = 0x702A;
 constexpr uint16_t ADD_OFFSET = 0x702B;
 }  // namespace ParamIndex
 
-// Fault bit meanings (Type 0x15 fault feedback / 0x3022 fault status word),
-// common across motor models.
+// Fault bits from the Type 0x15 fault feedback frame.
 namespace FaultBit
 {
 constexpr uint32_t OVERTEMPERATURE = 1u << 0;
@@ -157,8 +167,7 @@ enum class RunState : uint8_t
   MOTOR = 2,
 };
 
-/// @brief Quantize a float in [x_min, x_max] to an unsigned integer with the
-/// given bit width (matches the RobStride manual's float_to_uint helper).
+// Quantize a float in [x_min, x_max] to an unsigned integer.
 inline uint16_t FloatToUint16(float x, float x_min, float x_max)
 {
   if (x < x_min) {x = x_min;}
@@ -167,15 +176,14 @@ inline uint16_t FloatToUint16(float x, float x_min, float x_max)
   return static_cast<uint16_t>(((x - x_min) * 65535.0f) / span);
 }
 
-/// @brief Inverse of FloatToUint16.
+// Inverse of FloatToUint16.
 inline float Uint16ToFloat(uint16_t x, float x_min, float x_max)
 {
   const float span = x_max - x_min;
   return (static_cast<float>(x) * span) / 65535.0f + x_min;
 }
 
-/// @brief Build the 29-bit extended CAN identifier used by every RobStride
-/// private-protocol frame: [comm_type:5][data_area_2:16][dest_id:8].
+// Build the 29-bit extended CAN id: [comm_type:5][data_area_2:16][dest_id:8].
 inline uint32_t BuildExtendedId(uint8_t comm_type, uint16_t data_area_2, uint8_t dest_id)
 {
   return (static_cast<uint32_t>(comm_type) << 24) |
