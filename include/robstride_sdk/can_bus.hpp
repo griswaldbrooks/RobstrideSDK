@@ -1,5 +1,5 @@
-// Copyright 2026
-// Apache License, Version 2.0
+// Copyright 2026 Minjo Kim
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef ROBSTRIDE_SDK__CAN_BUS_HPP_
 #define ROBSTRIDE_SDK__CAN_BUS_HPP_
@@ -16,12 +16,8 @@
 namespace robstride_sdk
 {
 
-/// @brief One SocketCAN raw socket bound to a single interface (e.g. "can0"),
-/// used non-blocking with an epoll-driven background read thread and
-/// sendmmsg()/recvmmsg() batched I/O. All command encode/decode happens in
-/// RobstrideMotor; this class only moves frames between the socket and the
-/// registered motors, so read()/write() calls in the hardware interface
-/// never block on CAN I/O.
+// One SocketCAN raw socket on a single interface, with an epoll read thread
+// and batched sendmmsg()/recvmmsg() I/O.
 class CanBus
 {
 public:
@@ -31,28 +27,24 @@ public:
   CanBus(const CanBus &) = delete;
   CanBus & operator=(const CanBus &) = delete;
 
-  /// @brief Opens and configures the socket (non-blocking, extended-frame,
-  /// tuned send/receive buffers). Must be called before Start().
-  /// @return false with errno set on failure.
+  // Opens and configures the socket. Must be called before Start().
   bool Open();
   void Close();
 
-  /// @brief Associates a motor with its CAN id for feedback dispatch.
-  /// Must be called before Start(); not safe to call concurrently with the
-  /// read thread.
+  // Associates a motor with its CAN id. Must be called before Start().
   void RegisterMotor(RobstrideMotor * motor);
 
-  /// @brief Starts the background epoll/recvmmsg read thread.
   void Start();
-  /// @brief Stops and joins the background read thread.
   void Stop();
 
-  /// @brief Sends a batch of frames in a single sendmmsg() syscall.
-  /// @return number of frames successfully queued to the kernel.
+  // Returns the number of frames queued to the kernel.
   int SendFrames(const std::vector<can_frame> & frames);
 
-  /// @brief Convenience wrapper for a single frame.
   bool SendFrame(const can_frame & frame);
+
+  // errno of the last incomplete send, or 0. ENOBUFS means the interface is
+  // not draining its transmit queue, typically bus-off.
+  int last_send_errno() const {return last_send_errno_.load(std::memory_order_relaxed);}
 
   const std::string & interface_name() const {return ifname_;}
 
@@ -64,6 +56,7 @@ private:
   int fd_ = -1;
   int epoll_fd_ = -1;
   std::atomic<bool> running_{false};
+  std::atomic<int> last_send_errno_{0};
   std::thread read_thread_;
   std::unordered_map<uint8_t, RobstrideMotor *> motors_;
 };

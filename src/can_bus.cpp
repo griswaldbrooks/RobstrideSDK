@@ -1,5 +1,5 @@
-// Copyright 2026
-// Apache License, Version 2.0
+// Copyright 2026 Minjo Kim
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -141,13 +141,13 @@ int CanBus::SendFrames(const std::vector<can_frame> & frames)
   }
 
   int sent_total = 0;
+  int send_errno = 0;
   unsigned int offset = 0;
   while (offset < msgs.size()) {
     const int n = sendmmsg(fd_, msgs.data() + offset, msgs.size() - offset, 0);
     if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        break;
-      }
+      // Keep the reason so callers can tell a wedged bus from silent motors.
+      send_errno = errno;
       break;
     }
     sent_total += n;
@@ -156,6 +156,7 @@ int CanBus::SendFrames(const std::vector<can_frame> & frames)
       break;
     }
   }
+  last_send_errno_.store(send_errno, std::memory_order_relaxed);
   return sent_total;
 }
 
